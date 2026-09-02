@@ -4,7 +4,7 @@ import { FormEvent, useCallback, useEffect, useRef, useState, useSyncExternalSto
 import {
   ArrowRight, Camera, Link2, Lock, Maximize, Mic, MicOff, MonitorUp, MonitorX,
   MessageSquare, PhoneOff, PictureInPicture2, Pin, PinOff, ShieldCheck, SignalHigh,
-  SlidersHorizontal, Sparkles, TriangleAlert, Users, Video, VideoOff,
+  SlidersHorizontal, Sparkles, TriangleAlert, Users, Video, VideoOff, Volume2, VolumeX,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -14,9 +14,14 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuLabel,
+  ContextMenuSeparator, ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Slider } from "@/components/ui/slider";
 import { Toggle } from "@/components/ui/toggle";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CallChat } from "@/components/call-chat";
@@ -27,6 +32,7 @@ import { PeerStats, rttQuality, usePeerStats } from "@/hooks/use-peer-stats";
 import { useSpeaking } from "@/hooks/use-speaking";
 import { StunProvider, getDefaultProvider, getProvider, iceServers, setProvider, subscribeProvider } from "@/lib/ice";
 import { AudioMode, MicChain, createMicChain } from "@/lib/mic";
+import { SHARE_MODES, ShareMode, VIDEO_PRESETS, VideoQuality, autoBitrate, tuneSender } from "@/lib/quality";
 import { ChatMessage, PeerState, WireMessage, parseWire } from "@/lib/wire";
 import { cn } from "@/lib/utils";
 
@@ -89,6 +95,12 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   const [outputId, setOutputId] = useState("");
   const [volumes, setVolumes] = useState<Record<string, number>>({});
   const [pinned, setPinned] = useState<string | null>(null);
+  const [videoQuality, setVideoQuality] = useState<VideoQuality>("auto");
+  const [shareMode, setShareMode] = useState<ShareMode>("detail");
+  // Настройки кодирования читаются из обработчиков соединения, созданных один
+  // раз при входе в комнату, — через state там было бы видно только начальное значение.
+  const quality = useRef<VideoQuality>("auto");
+  const share = useRef<ShareMode>("detail");
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const mic = useRef<MicChain | null>(null);
   const cameraTrack = useRef<MediaStreamTrack | null>(null);
@@ -120,6 +132,21 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   /** Уровень читаем через ref, чтобы полоска в настройках не пересоздавала эффект. */
   const micLevel = useCallback(() => mic.current?.level() ?? 0, []);
 
+  /** Раздает текущие ограничения кодирования всем исходящим видео. */
+  const tuneVideoSenders = useCallback(async () => {
+    const mode = SHARE_MODES[share.current];
+    const preset = VIDEO_PRESETS[quality.current];
+    // В «Автоматически» потолок зависит от того, скольким мы сейчас отправляем.
+    const bitrate = quality.current === "auto" ? autoBitrate(connections.current.size) : preset.bitrate;
+    const options = screenTrack.current
+      ? { bitrate: mode.bitrate, frameRate: mode.frameRate, degradation: mode.degradation }
+      : { bitrate, degradation: "balanced" as const };
+    await Promise.all([...connections.current.values()].map(async (peer) => {
+      const sender = peer.getSenders().find((item) => item.track?.kind === "video");
+      if (sender) await tuneSender(sender, options).catch(() => undefined);
+    }));
+  }, []);
+
   /** Рассылает сообщение всем участникам по их каналам данных. */
   const broadcast = useCallback((message: WireMessage) => {
     const payload = JSON.stringify(message);
@@ -136,6 +163,12 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     if (screen !== "call") return;
     broadcast({ kind: "state", muted, cameraOff, sharing });
   }, [screen, muted, cameraOff, sharing, broadcast]);
+
+  // Доля аплинка на каждого зависит от числа собеседников, поэтому при смене
+  // состава потолки пересчитываем: иначе ушедший так и держит свою долю занятой.
+  useEffect(() => {
+    if (screen === "call") void tuneVideoSenders();
+  }, [screen, peers.length, tuneVideoSenders]);
 
   function sendChat(text: string) {
     const at = Date.now();
@@ -237,6 +270,8 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     chain.setGain(micGain);
     void chain.setMode(audioMode);
     cameraTrack.current = stream.getVideoTracks()[0] ?? null;
+    // Для камеры важнее плавность: при узком канале кодек уронит разрешение, а не кадры.
+    if (cameraTrack.current) cameraTrack.current.contentHint = "motion";
     setMicStream(chain.stream);
     setMicId(stream.getAudioTracks()[0].getSettings().deviceId ?? "");
     setCameraId(cameraTrack.current?.getSettings().deviceId ?? "");
@@ -347,6 +382,9 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         peer.onconnectionstatechange = () => {
           const connected = peer.connectionState === "connected";
           patchPeer(peerId, { live: connected, ...(connected && { stalled: false }) });
+          // Ограничения кодирования ставим только после переговоров: до них
+          // у отправителя еще нет encodings, и настраивать нечего.
+          if (connected) void tuneVideoSenders();
           if (peer.connectionState === "failed" && !closed) {
             patchPeer(peerId, { stalled: true });
             peer.restartIce();
@@ -523,14 +561,18 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       stopShare();
       return;
     }
+    const mode = SHARE_MODES[share.current];
     let display: MediaStream;
     try {
-      display = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { max: 30 } }, audio: false });
+      display = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { max: mode.frameRate } }, audio: false });
     } catch {
       return; // пользователь отменил выбор окна
     }
     const track = display.getVideoTracks()[0];
     if (!track) return;
+    // Подсказка кодеку, чем жертвовать при нехватке канала. С "text" он держит
+    // разрешение, и надписи на экране остаются читаемыми, а не расплываются.
+    track.contentHint = mode.contentHint;
     screenTrack.current = track;
     setPreview(new MediaStream([track]));
     track.addEventListener("ended", stopShare);
@@ -540,6 +582,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       else if (outgoing.current) peer.addTrack(track, outgoing.current);
     });
     setSharing(true);
+    void tuneVideoSenders();
   }
 
   function stopShare() {
@@ -555,6 +598,8 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       if (sender) void sender.replaceTrack(camera);
     });
     setSharing(false);
+    // Возвращаем камере ее собственные ограничения вместо экранных.
+    void tuneVideoSenders();
   }
 
   function changeGain(value: number) {
@@ -579,10 +624,17 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
 
   // Камера меняется через replaceTrack — переговоров не требует, звонок не прерывается.
   async function changeCamera(deviceId: string) {
+    // Новую камеру сразу берем в том разрешении, которое выбрано в настройках качества.
+    const preset = VIDEO_PRESETS[quality.current];
     let next: MediaStream;
     try {
       next = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+        video: {
+          deviceId: { exact: deviceId },
+          width: { ideal: preset.width ?? 1280 },
+          height: { ideal: preset.height ?? 720 },
+          frameRate: { ideal: 30, max: 30 },
+        },
       });
     } catch {
       toast.error("Не удалось переключить камеру", { description: "Устройство занято другой программой.", id: "camera" });
@@ -591,6 +643,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     const track = next.getVideoTracks()[0];
     if (!track) return;
     track.enabled = !cameraOff;
+    track.contentHint = "motion";
     const previous = cameraTrack.current;
     cameraTrack.current = track;
     setCameraId(deviceId);
@@ -603,12 +656,37 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         if (sender) void sender.replaceTrack(track);
         else if (outgoing.current) peer.addTrack(track, outgoing.current);
       });
+      void tuneVideoSenders();
     }
     previous?.stop();
   }
 
   function changeVolume(id: string, value: number) {
     setVolumes((current) => ({ ...current, [id]: value }));
+  }
+
+  async function changeQuality(next: VideoQuality) {
+    setVideoQuality(next);
+    quality.current = next;
+    const preset = VIDEO_PRESETS[next];
+    // Разрешение меняем на самом треке: ideal не уронит камеру, которая столько не умеет.
+    if (cameraTrack.current && preset.width) {
+      await cameraTrack.current
+        .applyConstraints({ width: { ideal: preset.width }, height: { ideal: preset.height } })
+        .catch(() => undefined);
+    }
+    await tuneVideoSenders();
+  }
+
+  async function changeShareMode(next: ShareMode) {
+    setShareMode(next);
+    share.current = next;
+    const track = screenTrack.current;
+    if (track) {
+      track.contentHint = SHARE_MODES[next].contentHint;
+      await track.applyConstraints({ frameRate: { max: SHARE_MODES[next].frameRate } }).catch(() => undefined);
+    }
+    await tuneVideoSenders();
   }
 
   async function copyInvite() {
@@ -648,6 +726,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         sinkId={outputId}
         pinned={pinned === tile.id}
         onPin={() => setPinned((current) => (current === tile.id ? null : tile.id))}
+        onVolumeChange={(value) => changeVolume(tile.id, value)}
       />
     );
     // Закрепленный участник занимает всю сцену, остальные уезжают в ленту снизу.
@@ -703,6 +782,10 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
               onGainChange={changeGain}
               mode={audioMode}
               onModeChange={changeMode}
+              videoQuality={videoQuality}
+              onVideoQualityChange={(value) => void changeQuality(value)}
+              shareMode={shareMode}
+              onShareModeChange={(value) => void changeShareMode(value)}
               level={micLevel}
               participants={peers}
               volumes={volumes}
@@ -1002,7 +1085,7 @@ function gridColumns(count: number) {
   return "grid-cols-2 lg:grid-cols-4";
 }
 
-function VideoTile({ name, stream, live, self = false, mirror = false, stats, speaking, state, volume = 1, sinkId, pinned, onPin }: {
+function VideoTile({ name, stream, live, self = false, mirror = false, stats, speaking, state, volume = 1, sinkId, pinned, onPin, onVolumeChange }: {
   id: string;
   name: string;
   stream: MediaStream | null;
@@ -1017,6 +1100,7 @@ function VideoTile({ name, stream, live, self = false, mirror = false, stats, sp
   sinkId?: string;
   pinned?: boolean;
   onPin?: () => void;
+  onVolumeChange?: (value: number) => void;
 }) {
   const video = useRef<HTMLVideoElement>(null);
   const frame = useRef<HTMLDivElement>(null);
@@ -1041,88 +1125,154 @@ function VideoTile({ name, stream, live, self = false, mirror = false, stats, sp
     if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
     else void frame.current?.requestFullscreen().catch(() => undefined);
   };
+  const canPip = typeof document !== "undefined" && document.pictureInPictureEnabled;
+  const openPip = () => void video.current?.requestPictureInPicture().catch(() => undefined);
+  const canControlVolume = !self && !!onVolumeChange;
 
   return (
-    <div
-      ref={frame}
-      onDoubleClick={toggleFullscreen}
-      className={cn(
-        "bg-stage-elevated group relative grid size-full min-h-0 place-items-center overflow-hidden rounded-xl",
-        "ring-primary ring-offset-stage transition-shadow duration-200",
-        // Во весь экран картинку уже не обрезаем: там важна вся сцена целиком.
-        "[&:fullscreen>video]:object-contain",
-        speaking && !state?.muted && "ring-2 ring-offset-2",
-      )}
-    >
-      <video
-        ref={video}
-        autoPlay
-        playsInline
-        muted={self}
-        className={cn("size-full object-cover", mirror && "-scale-x-100", !hasVideo && "hidden")}
-      />
-      {!hasVideo && (
-        <Avatar className="size-[clamp(2.75rem,6vw,4.5rem)]">
-          <AvatarFallback className="bg-white/10 text-[clamp(0.9rem,1.6vw,1.5rem)] font-bold text-white">
-            {initials(name)}
-          </AvatarFallback>
-        </Avatar>
-      )}
-      <Badge
-        variant="secondary"
-        className="absolute bottom-2 left-2 max-w-[calc(100%-1rem)] gap-1.5 bg-black/60 text-white backdrop-blur-sm"
-      >
-        {state?.muted && <MicOff className="text-destructive size-3 shrink-0" />}
-        {state?.sharing && <MonitorUp className="text-primary size-3 shrink-0" />}
-        <span className="truncate">{name}</span>
-        {!live && !self && <span className="text-muted-foreground shrink-0">· подключается</span>}
-      </Badge>
-
-      {/* Управление плиткой держим скрытым до наведения: в сетке из восьми
-          человек постоянные кнопки превращают сцену в панель приборов. */}
-      <div className="absolute top-2 left-2 flex gap-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
-        {onPin && (
-          <TileAction label={pinned ? "Открепить" : "Закрепить"} onClick={onPin}>
-            {pinned ? <PinOff /> : <Pin />}
-          </TileAction>
-        )}
-        {hasVideo && typeof document !== "undefined" && document.pictureInPictureEnabled && (
-          <TileAction
-            label="Отдельным окном"
-            onClick={() => void video.current?.requestPictureInPicture().catch(() => undefined)}
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <div
+          ref={frame}
+          onDoubleClick={toggleFullscreen}
+          className={cn(
+            "bg-stage-elevated group relative grid size-full min-h-0 place-items-center overflow-hidden rounded-xl",
+            "ring-primary ring-offset-stage transition-shadow duration-200",
+            // Во весь экран картинку уже не обрезаем: там важна вся сцена целиком.
+            "[&:fullscreen>video]:object-contain",
+            speaking && !state?.muted && "ring-2 ring-offset-2",
+          )}
+        >
+          <video
+            ref={video}
+            autoPlay
+            playsInline
+            muted={self}
+            className={cn("size-full object-cover", mirror && "-scale-x-100", !hasVideo && "hidden")}
+          />
+          {!hasVideo && (
+            <Avatar className="size-[clamp(2.75rem,6vw,4.5rem)]">
+              <AvatarFallback className="bg-white/10 text-[clamp(0.9rem,1.6vw,1.5rem)] font-bold text-white">
+                {initials(name)}
+              </AvatarFallback>
+            </Avatar>
+          )}
+          <Badge
+            variant="secondary"
+            className="absolute bottom-2 left-2 max-w-[calc(100%-1rem)] gap-1.5 bg-black/60 text-white backdrop-blur-sm"
           >
-            <PictureInPicture2 />
-          </TileAction>
-        )}
-        {hasVideo && (
-          <TileAction label="На весь экран" onClick={toggleFullscreen}>
-            <Maximize />
-          </TileAction>
-        )}
-      </div>
+            {state?.muted && <MicOff className="text-destructive size-3 shrink-0" />}
+            {state?.sharing && <MonitorUp className="text-primary size-3 shrink-0" />}
+            {canControlVolume && volume === 0 && <VolumeX className="text-destructive size-3 shrink-0" />}
+            <span className="truncate">{name}</span>
+            {!live && !self && <span className="text-muted-foreground shrink-0">· подключается</span>}
+          </Badge>
 
-      {!self && live && stats?.rtt != null && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Badge
-              variant="secondary"
-              className="absolute top-2 right-2 gap-1 bg-black/60 font-mono text-[10px] backdrop-blur-sm"
+          {/* Управление плиткой держим скрытым до наведения: в сетке из восьми
+              человек постоянные кнопки превращают сцену в панель приборов. */}
+          <div className="absolute top-2 left-2 flex gap-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+            {onPin && (
+              <TileAction label={pinned ? "Открепить" : "Закрепить"} onClick={onPin}>
+                {pinned ? <PinOff /> : <Pin />}
+              </TileAction>
+            )}
+            {hasVideo && canPip && (
+              <TileAction label="Отдельным окном" onClick={openPip}>
+                <PictureInPicture2 />
+              </TileAction>
+            )}
+            {hasVideo && (
+              <TileAction label="На весь экран" onClick={toggleFullscreen}>
+                <Maximize />
+              </TileAction>
+            )}
+          </div>
+
+          {!self && live && stats?.rtt != null && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge
+                  variant="secondary"
+                  className="absolute top-2 right-2 gap-1 bg-black/60 font-mono text-[10px] backdrop-blur-sm"
+                >
+                  <span className={cn("size-1.5 rounded-full", SIGNAL_COLOR[rttQuality(stats.rtt)])} />
+                  {stats.rtt} мс
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent side="left" className="font-mono text-xs">
+                <div>задержка {stats.rtt} мс</div>
+                {stats.loss != null && <div>потери {stats.loss}%</div>}
+                {stats.kbps != null && <div>{stats.kbps} кбит/с</div>}
+                {stats.width && <div>{stats.width}×{stats.height}{stats.fps ? ` · ${stats.fps} fps` : ""}</div>}
+              </TooltipContent>
+            </Tooltip>
+          )}
+        </div>
+      </ContextMenuTrigger>
+
+      <ContextMenuContent>
+        <ContextMenuLabel>
+          <span className="truncate">{name}</span>
+          {stats?.route && (
+            <span className="text-muted-foreground ml-auto text-[11px] font-normal">
+              {ROUTE_SHORT[stats.route]}
+            </span>
+          )}
+        </ContextMenuLabel>
+
+        {canControlVolume && (
+          <>
+            <ContextMenuSeparator />
+            {/* Ползунок — не пункт меню: перехватываем указатель, иначе Radix
+                примет перетаскивание за выбор и закроет меню на первом же движении. */}
+            <div className="px-2 py-1.5" onPointerDown={(event) => event.stopPropagation()}>
+              <div className="mb-2 flex items-baseline justify-between text-xs">
+                <span className="text-muted-foreground">Громкость</span>
+                <span className="font-mono font-semibold tabular-nums">{Math.round(volume * 100)}%</span>
+              </div>
+              <Slider
+                value={[volume]}
+                max={1}
+                step={0.01}
+                aria-label={`Громкость: ${name}`}
+                onValueChange={([next]) => onVolumeChange!(next)}
+              />
+            </div>
+            <ContextMenuItem
+              // preventDefault оставляет меню открытым: громкость часто правят несколькими нажатиями.
+              onSelect={(event) => { event.preventDefault(); onVolumeChange!(volume > 0 ? 0 : 1); }}
             >
-              <span className={cn("size-1.5 rounded-full", SIGNAL_COLOR[rttQuality(stats.rtt)])} />
-              {stats.rtt} мс
-            </Badge>
-          </TooltipTrigger>
-          <TooltipContent side="left" className="font-mono text-xs">
-            <div>задержка {stats.rtt} мс</div>
-            {stats.loss != null && <div>потери {stats.loss}%</div>}
-            {stats.kbps != null && <div>{stats.kbps} кбит/с</div>}
-            {stats.width && <div>{stats.width}×{stats.height}{stats.fps ? ` · ${stats.fps} fps` : ""}</div>}
-          </TooltipContent>
-        </Tooltip>
-      )}
-    </div>
+              {volume > 0 ? <VolumeX /> : <Volume2 />}
+              {volume > 0 ? "Заглушить для себя" : "Включить звук"}
+            </ContextMenuItem>
+          </>
+        )}
+
+        <ContextMenuSeparator />
+        {onPin && (
+          <ContextMenuItem onSelect={onPin}>
+            {pinned ? <PinOff /> : <Pin />}
+            {pinned ? "Открепить" : "Закрепить на всю сцену"}
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem disabled={!hasVideo} onSelect={toggleFullscreen}>
+          <Maximize />На весь экран
+        </ContextMenuItem>
+        {canPip && (
+          <ContextMenuItem disabled={!hasVideo} onSelect={openPip}>
+            <PictureInPicture2 />В отдельном окне
+          </ContextMenuItem>
+        )}
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
+
+const ROUTE_SHORT: Record<NonNullable<PeerStats["route"]>, string> = {
+  local: "локальная сеть",
+  direct: "напрямую",
+  relay: "через релей",
+};
 
 function TileAction({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {
   return (

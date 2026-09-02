@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Camera, Headphones, Mic, SlidersHorizontal, Volume2, VolumeX, Waves } from "lucide-react";
+import { Camera, Gauge, Headphones, Mic, MonitorUp, SlidersHorizontal, Volume2, VolumeX, Waves } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -11,6 +11,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTr
 import { Slider } from "@/components/ui/slider";
 import { supportsOutputChoice } from "@/hooks/use-devices";
 import { AUDIO_MODES, AudioMode, supportsVoiceIsolation } from "@/lib/mic";
+import { SHARE_MODES, ShareMode, VIDEO_PRESETS, VideoQuality } from "@/lib/quality";
 
 type Participant = { id: string; name: string };
 
@@ -27,6 +28,10 @@ type Props = {
   onGainChange: (value: number) => void;
   mode: AudioMode;
   onModeChange: (mode: AudioMode) => void;
+  videoQuality: VideoQuality;
+  onVideoQualityChange: (value: VideoQuality) => void;
+  shareMode: ShareMode;
+  onShareModeChange: (value: ShareMode) => void;
   level: () => number;
   participants: Participant[];
   volumes: Record<string, number>;
@@ -37,6 +42,7 @@ type Props = {
 export function CallDevices({
   devices, micId, onMicChange, cameraId, onCameraChange, hasCamera,
   outputId, onOutputChange, gain, onGainChange, mode, onModeChange, level,
+  videoQuality, onVideoQualityChange, shareMode, onShareModeChange,
   participants, volumes, onVolumeChange, trigger,
 }: Props) {
   const [open, setOpen] = useState(false);
@@ -121,6 +127,50 @@ export function CallDevices({
             fallback="Камера"
             empty="Камера не найдена"
           />
+        </div>
+
+        <Separator className="my-5" />
+
+        <div className="space-y-3 px-4">
+          <Label htmlFor="quality" className="text-xs font-semibold tracking-wide uppercase">
+            <Gauge className="size-3.5" /> Качество видео
+          </Label>
+          <Select value={videoQuality} onValueChange={(value) => onVideoQualityChange(value as VideoQuality)}>
+            <SelectTrigger id="quality" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(VIDEO_PRESETS) as VideoQuality[]).map((id) => (
+                <SelectItem key={id} value={id}>{VIDEO_PRESETS[id].label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-muted-foreground text-xs leading-snug">{VIDEO_PRESETS[videoQuality].hint}</p>
+          <p className="text-muted-foreground text-xs leading-snug">
+            Ограничение действует на исходящее видео и применяется на лету, без переподключения.
+          </p>
+        </div>
+
+        <Separator className="my-5" />
+
+        <div className="space-y-3 px-4">
+          <Label htmlFor="share" className="text-xs font-semibold tracking-wide uppercase">
+            <MonitorUp className="size-3.5" /> Демонстрация экрана
+          </Label>
+          <Select value={shareMode} onValueChange={(value) => onShareModeChange(value as ShareMode)}>
+            <SelectTrigger id="share" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {(Object.keys(SHARE_MODES) as ShareMode[]).map((id) => (
+                <SelectItem key={id} value={id}>{SHARE_MODES[id].label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-muted-foreground text-xs leading-snug">{SHARE_MODES[shareMode].hint}</p>
+          <p className="text-muted-foreground text-xs leading-snug">
+            Выбор говорит кодеку, чем жертвовать, когда канала не хватает: разрешением или частотой кадров.
+          </p>
         </div>
 
         {canChooseOutput && (
