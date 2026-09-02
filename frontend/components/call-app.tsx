@@ -2,8 +2,9 @@
 
 import { FormEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
-  ArrowRight, Camera, Link2, Lock, Mic, MicOff, MonitorUp, MonitorX,
-  MessageSquare, PhoneOff, ShieldCheck, SignalHigh, Sparkles, TriangleAlert, Users, Video, VideoOff,
+  ArrowRight, Camera, Link2, Lock, Maximize, Mic, MicOff, MonitorUp, MonitorX,
+  MessageSquare, PhoneOff, PictureInPicture2, Pin, PinOff, ShieldCheck, SignalHigh,
+  SlidersHorizontal, Sparkles, TriangleAlert, Users, Video, VideoOff,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -19,10 +20,13 @@ import { Separator } from "@/components/ui/separator";
 import { Toggle } from "@/components/ui/toggle";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CallChat } from "@/components/call-chat";
+import { CallDevices } from "@/components/call-devices";
 import { CallSettings } from "@/components/call-settings";
+import { useDevices } from "@/hooks/use-devices";
 import { PeerStats, rttQuality, usePeerStats } from "@/hooks/use-peer-stats";
 import { useSpeaking } from "@/hooks/use-speaking";
 import { StunProvider, getDefaultProvider, getProvider, iceServers, setProvider, subscribeProvider } from "@/lib/ice";
+import { AudioMode, MicChain, createMicChain } from "@/lib/mic";
 import { ChatMessage, PeerState, WireMessage, parseWire } from "@/lib/wire";
 import { cn } from "@/lib/utils";
 
@@ -77,6 +81,22 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatOpen, setChatOpen] = useState(false);
   const [unread, setUnread] = useState(0);
+  // Личные настройки: слышно и видно их только здесь, участникам ничего не уходит.
+  const [micGain, setMicGain] = useState(1);
+  const [audioMode, setAudioMode] = useState<AudioMode>("standard");
+  const [micId, setMicId] = useState("");
+  const [cameraId, setCameraId] = useState("");
+  const [outputId, setOutputId] = useState("");
+  const [volumes, setVolumes] = useState<Record<string, number>>({});
+  const [pinned, setPinned] = useState<string | null>(null);
+  const [micStream, setMicStream] = useState<MediaStream | null>(null);
+  const mic = useRef<MicChain | null>(null);
+  const cameraTrack = useRef<MediaStreamTrack | null>(null);
+  // Все исходящие треки живут в одном MediaStream: его id уходит в msid, и по
+  // нему собеседник собирает звук с картинкой в одну плитку.
+  const outgoing = useRef<MediaStream | null>(null);
+  // Демонстрацию закрепляем один раз: иначе снятый пин вернется на первом же мьюте.
+  const autoPinned = useRef(new Set<string>());
   const screenTrack = useRef<MediaStreamTrack | null>(null);
   const connections = useRef(new Map<string, RTCPeerConnection>());
   const channels = useRef(new Map<string, RTCDataChannel>());
@@ -88,10 +108,17 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   const canShare = typeof navigator !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia;
   const hasTurn = !!turn?.urls;
   const stats = usePeerStats(connections, screen === "call");
+  const devices = useDevices(screen === "call");
+  // Свой уровень берем с выхода микрофонного тракта: он переживает смену
+  // устройства и уже учитывает громкость, поэтому подсветка совпадает с тем,
+  // что реально слышат остальные.
   const speaking = useSpeaking(
-    [{ id: "self", stream: localStream }, ...peers.map((peer) => ({ id: peer.id, stream: peer.stream }))],
+    [{ id: "self", stream: micStream }, ...peers.map((peer) => ({ id: peer.id, stream: peer.stream }))],
     screen === "call",
   );
+
+  /** Уровень читаем через ref, чтобы полоска в настройках не пересоздавала эффект. */
+  const micLevel = useCallback(() => mic.current?.level() ?? 0, []);
 
   /** Рассылает сообщение всем участникам по их каналам данных. */
   const broadcast = useCallback((message: WireMessage) => {
@@ -201,6 +228,19 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     setHasCamera(camera);
     setCameraOff(!camera);
 
+    // Микрофонный тракт поднимаем до входа в комнату: собеседникам с самого
+    // первого оффера уходит именно его выход. Тогда смена микрофона позже
+    // не потребует переговоров — трек в senders остается прежним.
+    const chain = createMicChain(stream.getAudioTracks()[0]);
+    outgoing.current = new MediaStream([chain.track]);
+    mic.current = chain;
+    chain.setGain(micGain);
+    void chain.setMode(audioMode);
+    cameraTrack.current = stream.getVideoTracks()[0] ?? null;
+    setMicStream(chain.stream);
+    setMicId(stream.getAudioTracks()[0].getSettings().deviceId ?? "");
+    setCameraId(cameraTrack.current?.getSettings().deviceId ?? "");
+
     let token = "";
     try {
       const response = await fetch(`${api}/rooms/${roomId}/participants`, {
@@ -257,6 +297,13 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
           if (!message) return;
           if (message.kind === "state") {
             patchPeer(peerId, { state: message });
+            // Показ экрана сам выходит на большой план — так же ведут себя переговорки.
+            if (message.sharing && !autoPinned.current.has(peerId)) {
+              autoPinned.current.add(peerId);
+              setPinned(peerId);
+            } else if (!message.sharing && autoPinned.current.delete(peerId)) {
+              setPinned((current) => (current === peerId ? null : current));
+            }
             return;
           }
           const author = names.current.get(peerId) ?? "Гость";
@@ -268,15 +315,24 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         };
 
         // Отдаем то, что показываем прямо сейчас: камеру или демонстрацию экрана.
-        stream.getAudioTracks().forEach((track) => peer.addTrack(track, stream));
-        const video = screenTrack.current ?? stream.getVideoTracks()[0];
-        if (video) peer.addTrack(video, stream);
+        // Оба трека кладем в один MediaStream: иначе ontrack на той стороне
+        // отдаст два разных потока и в плитке окажется либо звук, либо картинка.
+        peer.addTrack(chain.track, outgoing.current!);
+        const video = screenTrack.current ?? cameraTrack.current;
+        if (video) peer.addTrack(video, outgoing.current!);
         else peer.addTransceiver("video", { direction: "recvonly" });
 
         peer.onicecandidate = ({ candidate }) => {
           if (candidate) void send({ type: "ice", to: peerId, candidate: candidate.toJSON() }).catch(reportProblem);
         };
-        peer.ontrack = ({ streams }) => patchPeer(peerId, { stream: streams[0] });
+        peer.ontrack = ({ streams, receiver }) => {
+          // Слышимая задержка = сеть + буфер джиттера. Хром по умолчанию держит
+          // в буфере запас в несколько десятков мс, и в статистике RTT он не виден.
+          // Просим минимальный: это единственная часть задержки, на которую мы влияем.
+          // ponytail: при 0 на рваной сети возможны щелчки, тогда поднять до 0.05.
+          Object.assign(receiver, { playoutDelayHint: 0 });
+          patchPeer(peerId, { stream: streams[0] });
+        };
         peer.onnegotiationneeded = () => {
           void (async () => {
             offering.add(peerId);
@@ -306,6 +362,8 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         connections.current.delete(peerId);
         names.current.delete(peerId);
         pending.delete(peerId);
+        autoPinned.current.delete(peerId);
+        setPinned((current) => (current === peerId ? null : current));
         setPeers((current) => current.filter((peer) => peer.id !== peerId));
       };
 
@@ -377,6 +435,13 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         connections.current.clear();
         screenTrack.current?.stop();
         screenTrack.current = null;
+        outgoing.current = null;
+        mic.current?.close();
+        mic.current = null;
+        autoPinned.current.clear();
+        // Камеру могли переключить по ходу звонка — тогда живой трек уже не из stream.
+        cameraTrack.current?.stop();
+        cameraTrack.current = null;
         stream.getTracks().forEach((track) => track.stop());
         // sendBeacon переживает закрытие вкладки; fetch — запасной путь.
         const leave = `${api}/rooms/${roomId}/leave?token=${encodeURIComponent(token)}`;
@@ -384,12 +449,16 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
           void fetch(leave, { method: "POST", keepalive: true }).catch(() => undefined);
         }
         setLocalStream(null);
+        setMicStream(null);
         cleanup.current = () => undefined;
         if (resetUrl) window.history.replaceState(null, "", window.location.pathname);
       };
 
       setScreen("call");
     } catch (reason) {
+      mic.current?.close();
+      mic.current = null;
+      setMicStream(null);
       stream.getTracks().forEach((track) => track.stop());
       if (token) void fetch(`${api}/rooms/${roomId}/participants?token=${encodeURIComponent(token)}`, { method: "DELETE" });
       setScreen("lobby");
@@ -433,10 +502,14 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     setSeconds(0);
     setMuted(false);
     setCameraOff(false);
+    setPinned(null);
+    setVolumes({});
   }
 
+  // Микрофон глушим на входе тракта: тогда молчит и то, что уходит участникам,
+  // и наша собственная подсветка «говорит».
   function toggleTrack(kind: "audio" | "video") {
-    const track = localStream?.getTracks().find((item) => item.kind === kind);
+    const track = kind === "audio" ? mic.current?.input() : localStream?.getVideoTracks()[0];
     if (!track) return;
     track.enabled = !track.enabled;
     if (kind === "audio") setMuted(!track.enabled);
@@ -464,7 +537,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     connections.current.forEach((peer) => {
       const sender = peer.getSenders().find((item) => item.track?.kind === "video");
       if (sender) void sender.replaceTrack(track);
-      else if (localStream) peer.addTrack(track, localStream);
+      else if (outgoing.current) peer.addTrack(track, outgoing.current);
     });
     setSharing(true);
   }
@@ -476,12 +549,66 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     setPreview(null);
     track.removeEventListener("ended", stopShare);
     track.stop();
-    const camera = localStream?.getVideoTracks()[0] ?? null;
+    const camera = cameraTrack.current;
     connections.current.forEach((peer) => {
       const sender = peer.getSenders().find((item) => item.track === track || item.track?.kind === "video");
       if (sender) void sender.replaceTrack(camera);
     });
     setSharing(false);
+  }
+
+  function changeGain(value: number) {
+    setMicGain(value);
+    mic.current?.setGain(value);
+  }
+
+  function changeMode(next: AudioMode) {
+    setAudioMode(next);
+    void mic.current?.setMode(next).catch(() =>
+      toast.error("Режим обработки не применился", { description: "Микрофон не поддерживает эти настройки.", id: "audio-mode" }));
+  }
+
+  async function changeMic(deviceId: string) {
+    try {
+      await mic.current?.useDevice(deviceId, audioMode);
+      setMicId(deviceId);
+    } catch {
+      toast.error("Не удалось переключить микрофон", { description: "Устройство занято другой программой.", id: "mic" });
+    }
+  }
+
+  // Камера меняется через replaceTrack — переговоров не требует, звонок не прерывается.
+  async function changeCamera(deviceId: string) {
+    let next: MediaStream;
+    try {
+      next = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
+      });
+    } catch {
+      toast.error("Не удалось переключить камеру", { description: "Устройство занято другой программой.", id: "camera" });
+      return;
+    }
+    const track = next.getVideoTracks()[0];
+    if (!track) return;
+    track.enabled = !cameraOff;
+    const previous = cameraTrack.current;
+    cameraTrack.current = track;
+    setCameraId(deviceId);
+    setHasCamera(true);
+    setLocalStream(new MediaStream([track]));
+    // Во время демонстрации исходящий трек не трогаем: новая камера вернется, когда показ закончится.
+    if (!screenTrack.current) {
+      connections.current.forEach((peer) => {
+        const sender = peer.getSenders().find((item) => item.track?.kind === "video");
+        if (sender) void sender.replaceTrack(track);
+        else if (outgoing.current) peer.addTrack(track, outgoing.current);
+      });
+    }
+    previous?.stop();
+  }
+
+  function changeVolume(id: string, value: number) {
+    setVolumes((current) => ({ ...current, [id]: value }));
   }
 
   async function copyInvite() {
@@ -511,6 +638,21 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       },
       ...peers.map((peer) => ({ ...peer, self: false, mirror: false })),
     ];
+    const renderTile = (tile: (typeof tiles)[number]) => (
+      <VideoTile
+        key={tile.id}
+        {...tile}
+        stats={stats[tile.id]}
+        speaking={speaking[tile.id]}
+        volume={volumes[tile.id] ?? 1}
+        sinkId={outputId}
+        pinned={pinned === tile.id}
+        onPin={() => setPinned((current) => (current === tile.id ? null : tile.id))}
+      />
+    );
+    // Закрепленный участник занимает всю сцену, остальные уезжают в ленту снизу.
+    const spotlight = pinned ? tiles.find((tile) => tile.id === pinned) : undefined;
+    const strip = spotlight ? tiles.filter((tile) => tile.id !== spotlight.id) : [];
     return (
       <main className="grid h-svh grid-rows-[auto_minmax(0,1fr)_auto] px-4 pb-5 sm:px-6 lg:px-10">
         <header className="flex h-[76px] items-center justify-between gap-4">
@@ -545,6 +687,30 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
                       {unread > 9 ? "9+" : unread}
                     </Badge>
                   )}
+                </Button>
+              }
+            />
+            <CallDevices
+              devices={devices}
+              micId={micId}
+              onMicChange={(id) => void changeMic(id)}
+              cameraId={cameraId}
+              onCameraChange={(id) => void changeCamera(id)}
+              hasCamera={hasCamera}
+              outputId={outputId}
+              onOutputChange={setOutputId}
+              gain={micGain}
+              onGainChange={changeGain}
+              mode={audioMode}
+              onModeChange={changeMode}
+              level={micLevel}
+              participants={peers}
+              volumes={volumes}
+              onVolumeChange={changeVolume}
+              trigger={
+                <Button variant="ghost" size="sm" aria-label="Звук и видео">
+                  <SlidersHorizontal />
+                  <span className="hidden sm:inline">Звук</span>
                 </Button>
               }
             />
@@ -594,11 +760,20 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
                 <Link2 />Скопировать ссылку
               </Button>
             </div>
+          ) : spotlight ? (
+            <div className="flex h-full flex-col gap-2.5 p-2.5 pb-24">
+              <div className="min-h-0 flex-1">{renderTile(spotlight)}</div>
+              {strip.length > 0 && (
+                <div className="flex h-20 shrink-0 gap-2.5 overflow-x-auto sm:h-24">
+                  {strip.map((tile) => (
+                    <div key={tile.id} className="aspect-video h-full shrink-0">{renderTile(tile)}</div>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
             <div className={cn("grid h-full auto-rows-[minmax(0,1fr)] gap-2.5 p-2.5 pb-24", gridColumns(tiles.length))}>
-              {tiles.map((tile) => (
-                <VideoTile key={tile.id} {...tile} stats={stats[tile.id]} speaking={speaking[tile.id]} />
-              ))}
+              {tiles.map(renderTile)}
             </div>
           )}
 
@@ -827,7 +1002,7 @@ function gridColumns(count: number) {
   return "grid-cols-2 lg:grid-cols-4";
 }
 
-function VideoTile({ name, stream, live, self = false, mirror = false, stats, speaking, state }: {
+function VideoTile({ name, stream, live, self = false, mirror = false, stats, speaking, state, volume = 1, sinkId, pinned, onPin }: {
   id: string;
   name: string;
   stream: MediaStream | null;
@@ -837,19 +1012,45 @@ function VideoTile({ name, stream, live, self = false, mirror = false, stats, sp
   stats?: PeerStats;
   speaking?: boolean;
   state?: PeerState;
+  /** Личная громкость участника: ноль глушит его только у нас. */
+  volume?: number;
+  sinkId?: string;
+  pinned?: boolean;
+  onPin?: () => void;
 }) {
   const video = useRef<HTMLVideoElement>(null);
+  const frame = useRef<HTMLDivElement>(null);
   const hasVideo = useLiveVideo(stream);
 
   useEffect(() => {
     if (video.current) video.current.srcObject = stream;
   }, [stream]);
 
+  // Громкость и устройство вывода живут на самом элементе: ни то, ни другое
+  // не уходит в сеть, поэтому собеседник о них не узнает.
+  useEffect(() => {
+    if (video.current) video.current.volume = volume;
+  }, [volume, stream]);
+
+  useEffect(() => {
+    const element = video.current as (HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> }) | null;
+    if (sinkId && element?.setSinkId) void element.setSinkId(sinkId).catch(() => undefined);
+  }, [sinkId, stream]);
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    else void frame.current?.requestFullscreen().catch(() => undefined);
+  };
+
   return (
     <div
+      ref={frame}
+      onDoubleClick={toggleFullscreen}
       className={cn(
-        "bg-stage-elevated relative grid size-full min-h-0 place-items-center overflow-hidden rounded-xl",
+        "bg-stage-elevated group relative grid size-full min-h-0 place-items-center overflow-hidden rounded-xl",
         "ring-primary ring-offset-stage transition-shadow duration-200",
+        // Во весь экран картинку уже не обрезаем: там важна вся сцена целиком.
+        "[&:fullscreen>video]:object-contain",
         speaking && !state?.muted && "ring-2 ring-offset-2",
       )}
     >
@@ -877,6 +1078,29 @@ function VideoTile({ name, stream, live, self = false, mirror = false, stats, sp
         {!live && !self && <span className="text-muted-foreground shrink-0">· подключается</span>}
       </Badge>
 
+      {/* Управление плиткой держим скрытым до наведения: в сетке из восьми
+          человек постоянные кнопки превращают сцену в панель приборов. */}
+      <div className="absolute top-2 left-2 flex gap-1 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+        {onPin && (
+          <TileAction label={pinned ? "Открепить" : "Закрепить"} onClick={onPin}>
+            {pinned ? <PinOff /> : <Pin />}
+          </TileAction>
+        )}
+        {hasVideo && typeof document !== "undefined" && document.pictureInPictureEnabled && (
+          <TileAction
+            label="Отдельным окном"
+            onClick={() => void video.current?.requestPictureInPicture().catch(() => undefined)}
+          >
+            <PictureInPicture2 />
+          </TileAction>
+        )}
+        {hasVideo && (
+          <TileAction label="На весь экран" onClick={toggleFullscreen}>
+            <Maximize />
+          </TileAction>
+        )}
+      </div>
+
       {!self && live && stats?.rtt != null && (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -897,6 +1121,27 @@ function VideoTile({ name, stream, live, self = false, mirror = false, stats, sp
         </Tooltip>
       )}
     </div>
+  );
+}
+
+function TileAction({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="secondary"
+          size="icon-sm"
+          aria-label={label}
+          // Двойной клик по плитке уже разворачивает ее — с кнопки событие не пускаем дальше.
+          onClick={(event) => { event.stopPropagation(); onClick(); }}
+          onDoubleClick={(event) => event.stopPropagation()}
+          className="bg-black/60 text-white backdrop-blur-sm hover:bg-black/80"
+        >
+          {children}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
