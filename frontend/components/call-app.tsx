@@ -64,18 +64,25 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     setRoom(roomId);
     if (!inviteRoom) window.history.replaceState(null, "", `?room=${roomId}`);
 
+    const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        audio,
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } },
       });
     } catch {
-      setScreen("lobby");
-      setError("Разрешите доступ к камере и микрофону, затем попробуйте снова.");
-      if (!inviteRoom) window.history.replaceState(null, "", window.location.pathname);
-      return;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio });
+      } catch {
+        setScreen("lobby");
+        setError("Разрешите доступ к микрофону, затем попробуйте снова.");
+        if (!inviteRoom) window.history.replaceState(null, "", window.location.pathname);
+        return;
+      }
     }
+    const hasVideo = stream.getVideoTracks().length > 0;
+    setCameraOff(!hasVideo);
 
     try {
       const join = await fetch(`${api}/rooms/${roomId}/participants`, {
@@ -108,6 +115,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         if (turn?.urls) iceServers.push(turn);
         const peer = new RTCPeerConnection({ iceServers });
         stream.getTracks().forEach((track) => peer.addTrack(track, stream));
+        if (!hasVideo) peer.addTransceiver("video", { direction: "recvonly" });
         peer.onicecandidate = ({ candidate }) => {
           if (candidate) void sendSignal({ type: "ice", candidate: candidate.toJSON() }).catch(showConnectionError);
         };
