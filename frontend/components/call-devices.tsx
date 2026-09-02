@@ -148,6 +148,7 @@ export function CallDevices({
           <p className="text-muted-foreground text-xs leading-snug">{VIDEO_PRESETS[videoQuality].hint}</p>
           <p className="text-muted-foreground text-xs leading-snug">
             Ограничение действует на исходящее видео и применяется на лету, без переподключения.
+            Тем, кто показывает вас миниатюрой, поток уходит экономный — канал не тратится впустую.
           </p>
         </div>
 

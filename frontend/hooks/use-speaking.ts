@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from "react";
 
+import { audioContext } from "@/lib/audio";
+
 type Source = { id: string; stream: MediaStream | null };
 
 const SPEAKING_THRESHOLD = 0.045;
@@ -22,17 +24,15 @@ export function useSpeaking(sources: Source[], active: boolean) {
     const withAudio = sources.filter((source) => source.stream?.getAudioTracks().length);
     if (!withAudio.length) return;
 
-    const AudioCtor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtor) return;
-
-    const context = new AudioCtor();
+    const context = audioContext();
     const buffer = new Float32Array(1024);
     const nodes = withAudio.map(({ id, stream }) => {
       const analyser = context.createAnalyser();
       analyser.fftSize = 2048;
       analyser.smoothingTimeConstant = 0.5;
-      context.createMediaStreamSource(stream!).connect(analyser);
-      return { id, analyser, lastLoud: 0 };
+      const source = context.createMediaStreamSource(stream!);
+      source.connect(analyser);
+      return { id, source, analyser, lastLoud: 0 };
     });
 
     let frame = 0;
@@ -56,7 +56,12 @@ export function useSpeaking(sources: Source[], active: boolean) {
 
     return () => {
       window.clearTimeout(frame);
-      void context.close();
+      // Контекст общий и переживает звонок, поэтому отсоединяем ровно свои узлы:
+      // иначе граф растет с каждым вошедшим и не разбирается до перезагрузки.
+      nodes.forEach((node) => {
+        node.source.disconnect();
+        node.analyser.disconnect();
+      });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [key, active]);

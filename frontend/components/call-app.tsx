@@ -32,8 +32,9 @@ import { PeerStats, rttQuality, usePeerStats } from "@/hooks/use-peer-stats";
 import { useSpeaking } from "@/hooks/use-speaking";
 import { StunProvider, getDefaultProvider, getProvider, iceServers, setProvider, subscribeProvider } from "@/lib/ice";
 import { AudioMode, MicChain, createMicChain } from "@/lib/mic";
-import { SHARE_MODES, ShareMode, VIDEO_PRESETS, VideoQuality, autoBitrate, tuneSender } from "@/lib/quality";
-import { ChatMessage, PeerState, WireMessage, parseWire } from "@/lib/wire";
+import { idleAudio } from "@/lib/audio";
+import { SHARE_MODES, ShareMode, THUMBNAIL, VIDEO_PRESETS, VideoQuality, autoBitrate, tuneSender } from "@/lib/quality";
+import { ChatMessage, PeerState, QualityLevel, WireMessage, parseWire } from "@/lib/wire";
 import { cn } from "@/lib/utils";
 
 // Совпадает с maxParticipants на бэкенде — выше mesh перестает тянуть.
@@ -101,6 +102,9 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   // раз при входе в комнату, — через state там было бы видно только начальное значение.
   const quality = useRef<VideoQuality>("auto");
   const share = useRef<ShareMode>("detail");
+  // Что собеседники попросили у нас и что мы попросили у них.
+  const requested = useRef(new Map<string, QualityLevel>());
+  const wanted = useRef(new Map<string, QualityLevel>());
   const [micStream, setMicStream] = useState<MediaStream | null>(null);
   const mic = useRef<MicChain | null>(null);
   const cameraTrack = useRef<MediaStreamTrack | null>(null);
@@ -132,18 +136,24 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   /** Уровень читаем через ref, чтобы полоска в настройках не пересоздавала эффект. */
   const micLevel = useCallback(() => mic.current?.level() ?? 0, []);
 
-  /** Раздает текущие ограничения кодирования всем исходящим видео. */
+  /**
+   * Раздает ограничения кодирования — каждому свои. Тот, кто показывает нас
+   * миниатюрой, попросил экономный поток, и незачем кодировать ему полный кадр.
+   */
   const tuneVideoSenders = useCallback(async () => {
     const mode = SHARE_MODES[share.current];
     const preset = VIDEO_PRESETS[quality.current];
     // В «Автоматически» потолок зависит от того, скольким мы сейчас отправляем.
     const bitrate = quality.current === "auto" ? autoBitrate(connections.current.size) : preset.bitrate;
-    const options = screenTrack.current
-      ? { bitrate: mode.bitrate, frameRate: mode.frameRate, degradation: mode.degradation }
-      : { bitrate, degradation: "balanced" as const };
-    await Promise.all([...connections.current.values()].map(async (peer) => {
+    await Promise.all([...connections.current.entries()].map(async ([id, peer]) => {
       const sender = peer.getSenders().find((item) => item.track?.kind === "video");
-      if (sender) await tuneSender(sender, options).catch(() => undefined);
+      if (!sender) return;
+      const options = requested.current.get(id) === "low"
+        ? { ...THUMBNAIL, degradation: "balanced" as const }
+        : screenTrack.current
+          ? { bitrate: mode.bitrate, frameRate: mode.frameRate, degradation: mode.degradation }
+          : { bitrate, degradation: "balanced" as const };
+      await tuneSender(sender, options).catch(() => undefined);
     }));
   }, []);
 
@@ -169,6 +179,24 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   useEffect(() => {
     if (screen === "call") void tuneVideoSenders();
   }, [screen, peers.length, tuneVideoSenders]);
+
+  // Просим у каждого ровно то качество, в котором показываем его сами: крупный
+  // план — полное, лента внизу и мелкая сетка — экономное. Освободившийся канал
+  // достается тому, на кого человек действительно смотрит.
+  useEffect(() => {
+    if (screen !== "call") return;
+    peers.forEach((peer) => {
+      const level: QualityLevel = pinned
+        ? pinned === peer.id ? "high" : "low"
+        : peers.length + 1 <= 4 ? "high" : "low";
+      if (wanted.current.get(peer.id) === level) return;
+      const channel = channels.current.get(peer.id);
+      // Канал мог еще не открыться — повторим на следующем обновлении состава.
+      if (channel?.readyState !== "open") return;
+      channel.send(JSON.stringify({ kind: "quality", level }));
+      wanted.current.set(peer.id, level);
+    });
+  }, [screen, peers, pinned]);
 
   function sendChat(text: string) {
     const at = Date.now();
@@ -341,6 +369,11 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
             }
             return;
           }
+          if (message.kind === "quality") {
+            requested.current.set(peerId, message.level);
+            void tuneVideoSenders();
+            return;
+          }
           const author = names.current.get(peerId) ?? "Гость";
           setMessages((history) => [
             ...history,
@@ -401,7 +434,16 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         names.current.delete(peerId);
         pending.delete(peerId);
         autoPinned.current.delete(peerId);
+        requested.current.delete(peerId);
+        wanted.current.delete(peerId);
         setPinned((current) => (current === peerId ? null : current));
+        // Личная громкость ушедшего больше ни к чему: id новые при каждом входе.
+        setVolumes((current) => {
+          if (!(peerId in current)) return current;
+          const next = { ...current };
+          delete next[peerId];
+          return next;
+        });
         setPeers((current) => current.filter((peer) => peer.id !== peerId));
       };
 
@@ -476,7 +518,11 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         outgoing.current = null;
         mic.current?.close();
         mic.current = null;
+        // Общий AudioContext не закрываем, но между звонками ему нечего делать.
+        idleAudio();
         autoPinned.current.clear();
+        requested.current.clear();
+        wanted.current.clear();
         // Камеру могли переключить по ходу звонка — тогда живой трек уже не из stream.
         cameraTrack.current?.stop();
         cameraTrack.current = null;

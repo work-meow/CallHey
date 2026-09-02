@@ -15,7 +15,8 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "check": "npm run lint && npm run typecheck && npm run build"
+    "test": "node --experimental-strip-types --no-warnings=MODULE_TYPELESS_PACKAGE_JSON --test lib/wire.test.mts",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build"
   },
   "dependencies": {
     "@fontsource-variable/jetbrains-mono": "5.2.8",

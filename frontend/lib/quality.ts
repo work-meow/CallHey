@@ -66,6 +66,13 @@ export const SHARE_MODES: Record<ShareMode, {
 };
 
 /**
+ * Для тех, кто у собеседника показан миниатюрой в ленте. В mesh это точнее
+ * simulcast: поток и так индивидуальный для каждого, поэтому лишние слои
+ * кодировать и отправлять не нужно — достаточно спросить, что человеку нужно.
+ */
+export const THUMBNAIL = { bitrate: 250_000, frameRate: 20, scale: 3 };
+
+/**
  * Сколько битрейта отдать одному собеседнику в режиме «Автоматически».
  *
  * В full mesh каждый кодирует и отправляет отдельный поток каждому: аплинк
@@ -92,6 +99,8 @@ export function autoBitrate(peers: number) {
 export async function tuneSender(sender: RTCRtpSender, options: {
   bitrate?: number;
   frameRate?: number;
+  /** Во сколько раз уменьшить кадр перед кодированием. 1 — не уменьшать. */
+  scale?: number;
   degradation: Degradation;
 }) {
   const params = sender.getParameters() as RTCRtpSendParameters & { degradationPreference?: Degradation };
@@ -99,6 +108,8 @@ export async function tuneSender(sender: RTCRtpSender, options: {
   // undefined снимает ограничение — так работает режим «Автоматически».
   params.encodings[0].maxBitrate = options.bitrate;
   params.encodings[0].maxFramerate = options.frameRate;
+  // Значение обязательно задавать всегда: иначе прошлое уменьшение так и останется.
+  params.encodings[0].scaleResolutionDownBy = options.scale ?? 1;
   params.degradationPreference = options.degradation;
   await sender.setParameters(params);
 }

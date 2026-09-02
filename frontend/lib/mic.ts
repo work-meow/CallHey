@@ -10,6 +10,8 @@
  * с участниками не нужны.
  */
 
+import { audioContext } from "@/lib/audio";
+
 export type AudioMode = "off" | "standard" | "voice";
 
 export const AUDIO_MODES: { id: AudioMode; label: string; hint: string }[] = [
@@ -38,7 +40,7 @@ export function supportsVoiceIsolation() {
 export type MicChain = ReturnType<typeof createMicChain>;
 
 export function createMicChain(initial: MediaStreamTrack) {
-  const context = new AudioContext();
+  const context = audioContext();
   const gain = context.createGain();
   const analyser = context.createAnalyser();
   analyser.fftSize = 1024;
@@ -98,9 +100,12 @@ export function createMicChain(initial: MediaStreamTrack) {
       source.connect(gain);
     },
 
+    /** Контекст общий на вкладку, поэтому закрываем не его, а только свои узлы. */
     close() {
       raw.stop();
-      void context.close();
+      source.disconnect();
+      gain.disconnect();
+      analyser.disconnect();
     },
   };
 }

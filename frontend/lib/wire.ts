@@ -2,9 +2,13 @@
  * Формат сообщений в RTCDataChannel. Идут напрямую между участниками:
  * сигналинг их не видит, нагрузки на сервер нет.
  */
+export type QualityLevel = "high" | "low";
+
 export type WireMessage =
   | { kind: "chat"; text: string; at: number }
-  | { kind: "state"; muted: boolean; cameraOff: boolean; sharing: boolean };
+  | { kind: "state"; muted: boolean; cameraOff: boolean; sharing: boolean }
+  /** Просьба к отправителю: столько качества нам сейчас достаточно. */
+  | { kind: "quality"; level: QualityLevel };
 
 export type ChatMessage = {
   id: string;
@@ -46,6 +50,10 @@ export function parseWire(raw: unknown): WireMessage | null {
       cameraOff: message.cameraOff === true,
       sharing: message.sharing === true,
     };
+  }
+  if (message.kind === "quality") {
+    // Только "low" понижает качество: неизвестное значение не должно глушить картинку.
+    return { kind: "quality", level: message.level === "low" ? "low" : "high" };
   }
   return null;
 }
