@@ -16,13 +16,22 @@ export type PeerStats = {
   /** Как идет медиа: напрямую по локальной сети, через NAT или через TURN-релей. */
   route: "local" | "direct" | "relay" | null;
   codec: string | null;
+  /** Исходящий поток этому участнику, кбит/с. В mesh он свой на каждого. */
+  outKbps: number | null;
+  outFps: number | null;
+  /**
+   * Почему кодировщик не отдает больше: не хватает канала или процессора.
+   * Это ответ на вопрос «почему картинка посыпалась» — гадать не нужно.
+   */
+  limit: "bandwidth" | "cpu" | "other" | null;
 };
 
-type Sample = { bytes: number; lost: number; received: number; at: number };
+type Sample = { bytes: number; lost: number; received: number; sent: number; at: number };
 
 const EMPTY: PeerStats = {
   rtt: null, loss: null, kbps: null, jitter: null,
   width: null, height: null, fps: null, route: null, codec: null,
+  outKbps: null, outFps: null, limit: null,
 };
 
 /**
@@ -64,6 +73,9 @@ export function usePeerStats(connections: RefObject<Map<string, RTCPeerConnectio
 
 const NO_STATS: Record<string, PeerStats> = {};
 
+// qualityLimitationReason еще не во всех определениях lib.dom, но есть в браузерах.
+type Outbound = RTCOutboundRtpStreamStats & { qualityLimitationReason?: string };
+
 async function readStats(peer: RTCPeerConnection, previous: Map<string, Sample>, id: string): Promise<PeerStats> {
   const report = await peer.getStats();
   const result: PeerStats = { ...EMPTY };
@@ -71,6 +83,7 @@ async function readStats(peer: RTCPeerConnection, previous: Map<string, Sample>,
   let pair: RTCIceCandidatePairStats | undefined;
   let video: RTCInboundRtpStreamStats | undefined;
   let audio: RTCInboundRtpStreamStats | undefined;
+  let outbound: Outbound | undefined;
   const codecs = new Map<string, string>();
 
   report.forEach((entry) => {
@@ -82,6 +95,8 @@ async function readStats(peer: RTCPeerConnection, previous: Map<string, Sample>,
     } else if (entry.type === "inbound-rtp") {
       if (entry.kind === "video") video = entry as RTCInboundRtpStreamStats;
       if (entry.kind === "audio") audio = entry as RTCInboundRtpStreamStats;
+    } else if (entry.type === "outbound-rtp" && entry.kind === "video") {
+      outbound = entry as Outbound;
     }
   });
 
@@ -100,21 +115,34 @@ async function readStats(peer: RTCPeerConnection, previous: Map<string, Sample>,
     result.width = video?.frameWidth ?? null;
     result.height = video?.frameHeight ?? null;
     result.fps = video?.framesPerSecond ? Math.round(video.framesPerSecond) : null;
-
-    const bytes = Number(media.bytesReceived ?? 0);
-    const lost = Number(media.packetsLost ?? 0);
-    const received = Number(media.packetsReceived ?? 0);
-    const now = performance.now();
-    const last = previous.get(id);
-    if (last) {
-      const seconds = (now - last.at) / 1000;
-      if (seconds > 0.2) result.kbps = Math.max(0, Math.round(((bytes - last.bytes) * 8) / seconds / 1000));
-      const deltaLost = Math.max(0, lost - last.lost);
-      const deltaTotal = deltaLost + Math.max(0, received - last.received);
-      if (deltaTotal > 0) result.loss = Math.round((deltaLost / deltaTotal) * 1000) / 10;
-    }
-    previous.set(id, { bytes, lost, received, at: now });
   }
+
+  if (outbound) {
+    const reason = outbound.qualityLimitationReason;
+    // "none" — ограничений нет, показывать в панели нечего.
+    result.limit = reason === "bandwidth" || reason === "cpu" ? reason : reason && reason !== "none" ? "other" : null;
+    result.outFps = outbound.framesPerSecond ? Math.round(outbound.framesPerSecond) : null;
+  }
+
+  // Счетчики в WebRTC накопительные, поэтому снимок храним даже когда медиа
+  // еще нет: иначе первая же дельта после подключения посчитается от нуля.
+  const bytes = Number(media?.bytesReceived ?? 0);
+  const lost = Number(media?.packetsLost ?? 0);
+  const received = Number(media?.packetsReceived ?? 0);
+  const sent = Number(outbound?.bytesSent ?? 0);
+  const now = performance.now();
+  const last = previous.get(id);
+  if (last) {
+    const seconds = (now - last.at) / 1000;
+    if (seconds > 0.2) {
+      if (media) result.kbps = Math.max(0, Math.round(((bytes - last.bytes) * 8) / seconds / 1000));
+      if (outbound) result.outKbps = Math.max(0, Math.round(((sent - last.sent) * 8) / seconds / 1000));
+    }
+    const deltaLost = Math.max(0, lost - last.lost);
+    const deltaTotal = deltaLost + Math.max(0, received - last.received);
+    if (deltaTotal > 0) result.loss = Math.round((deltaLost / deltaTotal) * 1000) / 10;
+  }
+  previous.set(id, { bytes, lost, received, sent, at: now });
 
   return result;
 }

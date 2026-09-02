@@ -29,6 +29,12 @@ const ROUTE_LABEL: Record<NonNullable<PeerStats["route"]>, string> = {
   relay: "Через TURN-релей",
 };
 
+const LIMIT_LABEL: Record<NonNullable<PeerStats["limit"]>, string> = {
+  bandwidth: "Качество режет канал",
+  cpu: "Качество режет процессор",
+  other: "Качество ограничено",
+};
+
 export function CallSettings({ provider, onProviderChange, participants, stats, trigger }: Props) {
   const [open, setOpen] = useState(false);
   const [pings, setPings] = useState<Record<string, number | null>>({});
@@ -127,6 +133,7 @@ function ParticipantStats({ participant, stats }: { participant: Participant; st
         <Row label="Задержка" value={stats?.rtt != null ? `${stats.rtt} мс` : "—"} tone={quality} />
         <Row label="Потери" value={stats?.loss != null ? `${stats.loss}%` : "—"} tone={(stats?.loss ?? 0) > 3 ? "poor" : "good"} />
         <Row label="Входящий" value={stats?.kbps != null ? `${stats.kbps} кбит/с` : "—"} />
+        <Row label="Исходящий" value={stats?.outKbps != null ? `${stats.outKbps} кбит/с` : "—"} />
         <Row label="Джиттер" value={stats?.jitter != null ? `${stats.jitter} мс` : "—"} />
         <Row label="Видео" value={stats?.width && stats?.height ? `${stats.width}×${stats.height}${stats.fps ? ` · ${stats.fps}` : ""}` : "—"} />
         <Row label="Кодек" value={stats?.codec ?? "—"} />
@@ -136,6 +143,16 @@ function ParticipantStats({ participant, stats }: { participant: Participant; st
         <div className="text-muted-foreground mt-2.5 flex items-center gap-1.5 text-[11px]">
           <Radio className="size-3" />
           {ROUTE_LABEL[stats.route]}
+        </div>
+      )}
+
+      {/* Прямой ответ на «почему картинка посыпалась»: гадать между каналом
+          и процессором не нужно, браузер знает сам. */}
+      {stats?.limit && (
+        <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-400">
+          <Gauge className="size-3" />
+          {LIMIT_LABEL[stats.limit]}
+          {stats.outFps != null && <span className="text-muted-foreground">· отдаем {stats.outFps} к/с</span>}
         </div>
       )}
     </div>

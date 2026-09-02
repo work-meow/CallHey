@@ -148,7 +148,10 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
     await Promise.all([...connections.current.entries()].map(async ([id, peer]) => {
       const sender = peer.getSenders().find((item) => item.track?.kind === "video");
       if (!sender) return;
-      const options = requested.current.get(id) === "low"
+      // Демонстрацию не ужимаем никогда: уменьшенный втрое экран нечитаем, а
+      // смотрят в звонке обычно именно на нее. Проверяем на стороне отправителя,
+      // потому что здесь про свою демонстрацию известно точно.
+      const options = requested.current.get(id) === "low" && !screenTrack.current
         ? { ...THUMBNAIL, degradation: "balanced" as const }
         : screenTrack.current
           ? { bitrate: mode.bitrate, frameRate: mode.frameRate, degradation: mode.degradation }
@@ -186,8 +189,9 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   useEffect(() => {
     if (screen !== "call") return;
     peers.forEach((peer) => {
-      const level: QualityLevel = pinned
-        ? pinned === peer.id ? "high" : "low"
+      // У того, кто показывает экран, экономию не просим ни при каких раскладах.
+      const level: QualityLevel = peer.state?.sharing ? "high"
+        : pinned ? pinned === peer.id ? "high" : "low"
         : peers.length + 1 <= 4 ? "high" : "low";
       if (wanted.current.get(peer.id) === level) return;
       const channel = channels.current.get(peer.id);
