@@ -1,0 +1,33 @@
+# TURN-ретранслятор для сетей, где прямое соединение не собирается:
+# мобильный интернет с CGNAT, корпоративные сети, симметричный NAT.
+#
+# network_mode: host — обязательное условие. TURN раздает клиентам адреса
+# из relay-диапазона, и через проброс портов Docker они бы не совпали
+# с тем, что видит клиент.
+services:
+  coturn:
+    image: coturn/coturn:4.7-alpine
+    restart: unless-stopped
+    network_mode: host
+    command: >
+      -n
+      --listening-port=3478
+      --realm=${TURN_REALM}
+      --external-ip=${TURN_PUBLIC_IP}
+      --relay-ip=${TURN_PUBLIC_IP}
+      --min-port=49160
+      --max-port=49200
+      --lt-cred-mech
+      --user=${TURN_USER}:${TURN_PASSWORD}
+      --fingerprint
+      --no-tls
+      --no-dtls
+      --no-multicast-peers
+      --no-cli
+      --no-software-attribute
+      --denied-peer-ip=10.0.0.0-10.255.255.255
+      --denied-peer-ip=172.16.0.0-172.31.255.255
+      --denied-peer-ip=192.168.0.0-192.168.255.255
+      --denied-peer-ip=169.254.0.0-169.254.255.255
+      --user-quota=12
+      --total-quota=100

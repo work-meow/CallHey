@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   ArrowRight, Camera, Link2, Lock, Mic, MicOff, MonitorUp, MonitorX,
-  MessageSquare, PhoneOff, ShieldCheck, SignalHigh, Sparkles, Users, Video, VideoOff,
+  MessageSquare, PhoneOff, ShieldCheck, SignalHigh, Sparkles, TriangleAlert, Users, Video, VideoOff,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -48,8 +48,15 @@ type Peer = {
   name: string;
   stream: MediaStream | null;
   live: boolean;
+  /** ICE не сошелся за отведенное время — почти всегда это NAT, который не пробить без TURN. */
+  stalled?: boolean;
+  /** Когда участник появился в комнате: по этому времени понимаем, что связь не встает. */
+  since: number;
   state?: PeerState;
 };
+
+/** Сколько ждем ICE, прежде чем признать, что прямое соединение не собирается. */
+const ICE_TIMEOUT_MS = 15_000;
 
 export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   const api = signalUrl.replace(/\/+$/, "");
@@ -79,6 +86,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   const startedAt = useRef(0);
   const cleanup = useRef<(resetUrl?: boolean) => void>(() => undefined);
   const canShare = typeof navigator !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia;
+  const hasTurn = !!turn?.urls;
   const stats = usePeerStats(connections, screen === "call");
   const speaking = useSpeaking(
     [{ id: "self", stream: localStream }, ...peers.map((peer) => ({ id: peer.id, stream: peer.stream }))],
@@ -119,9 +127,30 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   }
 
   const live = peers.filter((peer) => peer.live).length;
+  const stalled = peers.filter((peer) => peer.stalled && !peer.live);
   const status = peers.length === 0
     ? "Ждем участников"
+    : stalled.length ? "Сеть не пропускает соединение"
     : live === peers.length ? "Все на связи" : `Соединяемся · ${live} из ${peers.length}`;
+
+  // Помечаем зависших по времени появления, а не по таймеру внутри соединения:
+  // участник может вообще не прислать offer, и тогда соединения просто нет.
+  useEffect(() => {
+    if (screen !== "call" || peers.every((peer) => peer.live || peer.stalled)) return;
+    const timer = window.setInterval(() => {
+      const deadline = Date.now() - ICE_TIMEOUT_MS;
+      setPeers((current) => {
+        let changed = false;
+        const next = current.map((peer) => {
+          if (peer.live || peer.stalled || peer.since > deadline) return peer;
+          changed = true;
+          return { ...peer, stalled: true };
+        });
+        return changed ? next : current;
+      });
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [screen, peers]);
 
   useEffect(() => {
     if (!live) return;
@@ -188,7 +217,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       setRoom(roomId);
       names.current.clear();
       (body.peers ?? []).forEach((peer) => names.current.set(peer.id, peer.name));
-      setPeers((body.peers ?? []).map((peer) => ({ id: peer.id, name: peer.name, stream: null, live: false })));
+      setPeers((body.peers ?? []).map((peer) => ({ id: peer.id, name: peer.name, stream: null, live: false, since: Date.now() })));
       window.history.replaceState(null, "", `?room=${roomId}`);
 
       const pending = new Map<string, RTCIceCandidateInit[]>();
@@ -260,8 +289,12 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
           })().catch(reportProblem);
         };
         peer.onconnectionstatechange = () => {
-          patchPeer(peerId, { live: peer.connectionState === "connected" });
-          if (peer.connectionState === "failed" && !closed) peer.restartIce();
+          const connected = peer.connectionState === "connected";
+          patchPeer(peerId, { live: connected, ...(connected && { stalled: false }) });
+          if (peer.connectionState === "failed" && !closed) {
+            patchPeer(peerId, { stalled: true });
+            peer.restartIce();
+          }
         };
         return peer;
       };
@@ -287,7 +320,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
           names.current.set(from, peerName);
           setPeers((current) => current.some((peer) => peer.id === from)
             ? current
-            : [...current, { id: from, name: peerName, stream: null, live: false }]);
+            : [...current, { id: from, name: peerName, stream: null, live: false, since: Date.now() }]);
           toast(`${peerName} присоединился`, { id: `join-${from}` });
           connect(from); // addTrack поднимет negotiationneeded, оффер уйдет сам
           return;
@@ -535,6 +568,15 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         </header>
 
         <section className="border-border bg-stage relative min-h-0 overflow-hidden rounded-xl border shadow-2xl" aria-label="Видеозвонок">
+          {stalled.length > 0 && (
+            <Alert variant="destructive" className="absolute inset-x-3 top-3 z-10 w-auto bg-black/85 backdrop-blur-sm">
+              <TriangleAlert />
+              <AlertDescription>
+                Не удалось построить прямое соединение с {listNames(stalled)}. Обычно так себя ведет мобильный интернет
+                или рабочая сеть — попробуйте другой Wi-Fi. {hasTurn ? "Резервный сервер тоже не помог." : "Для таких сетей нужен TURN-сервер."}
+              </AlertDescription>
+            </Alert>
+          )}
           {peers.length === 0 ? (
             <div className="absolute inset-0 flex flex-col items-center justify-center px-6 pb-24 text-center" role="status">
               <div className="relative mb-6">
@@ -900,6 +942,12 @@ function Logo() {
       <small className="text-primary font-mono text-[10px] font-medium">звонки</small>
     </div>
   );
+}
+
+function listNames(peers: Peer[]) {
+  const names = peers.map((peer) => peer.name);
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(", ")} и ${names.at(-1)}`;
 }
 
 function createRoomId() {
