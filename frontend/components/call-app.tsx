@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   ArrowRight, Camera, Link2, Lock, Mic, MicOff, MonitorUp, MonitorX,
-  PhoneOff, ShieldCheck, Sparkles, Users, Video, VideoOff, Zap,
+  MessageSquare, PhoneOff, ShieldCheck, SignalHigh, Sparkles, Users, Video, VideoOff,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -18,6 +18,12 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Toggle } from "@/components/ui/toggle";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { CallChat } from "@/components/call-chat";
+import { CallSettings } from "@/components/call-settings";
+import { PeerStats, rttQuality, usePeerStats } from "@/hooks/use-peer-stats";
+import { useSpeaking } from "@/hooks/use-speaking";
+import { StunProvider, getDefaultProvider, getProvider, iceServers, setProvider, subscribeProvider } from "@/lib/ice";
+import { ChatMessage, PeerState, WireMessage, parseWire } from "@/lib/wire";
 import { cn } from "@/lib/utils";
 
 // Совпадает с maxParticipants на бэкенде — выше mesh перестает тянуть.
@@ -42,6 +48,7 @@ type Peer = {
   name: string;
   stream: MediaStream | null;
   live: boolean;
+  state?: PeerState;
 };
 
 export function CallApp({ initialRoom, signalUrl, turn }: Props) {
@@ -59,11 +66,57 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
   const [sharing, setSharing] = useState(false);
   const [preview, setPreview] = useState<MediaStream | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const provider = useSyncExternalStore(subscribeProvider, getProvider, getDefaultProvider);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [unread, setUnread] = useState(0);
   const screenTrack = useRef<MediaStreamTrack | null>(null);
   const connections = useRef(new Map<string, RTCPeerConnection>());
+  const channels = useRef(new Map<string, RTCDataChannel>());
+  // Имена и состояние панели читаются из обработчиков канала, поэтому живут в ref.
+  const names = useRef(new Map<string, string>());
+  const chatOpenRef = useRef(false);
   const startedAt = useRef(0);
   const cleanup = useRef<(resetUrl?: boolean) => void>(() => undefined);
   const canShare = typeof navigator !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia;
+  const stats = usePeerStats(connections, screen === "call");
+  const speaking = useSpeaking(
+    [{ id: "self", stream: localStream }, ...peers.map((peer) => ({ id: peer.id, stream: peer.stream }))],
+    screen === "call",
+  );
+
+  /** Рассылает сообщение всем участникам по их каналам данных. */
+  const broadcast = useCallback((message: WireMessage) => {
+    const payload = JSON.stringify(message);
+    channels.current.forEach((channel) => {
+      if (channel.readyState === "open") channel.send(payload);
+    });
+  }, []);
+
+  // Собеседники должны видеть, что микрофон выключен, даже когда человек молчит.
+  // Ref нужен, чтобы канал, открывшийся позже, отправил актуальное состояние.
+  const selfState = useRef<PeerState>({ muted: false, cameraOff: false, sharing: false });
+  useEffect(() => {
+    selfState.current = { muted, cameraOff, sharing };
+    if (screen !== "call") return;
+    broadcast({ kind: "state", muted, cameraOff, sharing });
+  }, [screen, muted, cameraOff, sharing, broadcast]);
+
+  function sendChat(text: string) {
+    const at = Date.now();
+    broadcast({ kind: "chat", text, at });
+    setMessages((current) => [...current, { id: `${at}-self`, author: name, text, at, own: true }]);
+  }
+
+  function changeProvider(next: StunProvider) {
+    setProvider(next);
+    // Перенастраиваем живые соединения и пересобираем маршрут — звонок не рвется.
+    connections.current.forEach((peer) => {
+      peer.setConfiguration({ iceServers: iceServers(next, turn), bundlePolicy: "max-bundle" });
+      peer.restartIce();
+    });
+    toast.success(`STUN: ${next.label}`, { description: "Маршрут пересобирается", id: "stun" });
+  }
 
   const live = peers.filter((peer) => peer.live).length;
   const status = peers.length === 0
@@ -133,6 +186,8 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
 
       setLocalStream(stream);
       setRoom(roomId);
+      names.current.clear();
+      (body.peers ?? []).forEach((peer) => names.current.set(peer.id, peer.name));
       setPeers((body.peers ?? []).map((peer) => ({ id: peer.id, name: peer.name, stream: null, live: false })));
       window.history.replaceState(null, "", `?room=${roomId}`);
 
@@ -157,12 +212,31 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         const existing = connections.current.get(peerId);
         if (existing) return existing;
 
-        const iceServers: RTCIceServer[] = [
-          { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
-        ];
-        if (turn?.urls) iceServers.push(turn);
-        const peer = new RTCPeerConnection({ iceServers, bundlePolicy: "max-bundle" });
+        const peer = new RTCPeerConnection({
+          iceServers: iceServers(getProvider(), turn),
+          bundlePolicy: "max-bundle",
+        });
         connections.current.set(peerId, peer);
+
+        // negotiated-канал с общим id: обе стороны открывают его сами, лишних
+        // переговоров нет. Создаем до addTrack, чтобы попасть в первый же offer.
+        const channel = peer.createDataChannel("mesh", { negotiated: true, id: 0 });
+        channels.current.set(peerId, channel);
+        channel.onopen = () => channel.send(JSON.stringify({ kind: "state", ...selfState.current }));
+        channel.onmessage = ({ data }) => {
+          const message = parseWire(data);
+          if (!message) return;
+          if (message.kind === "state") {
+            patchPeer(peerId, { state: message });
+            return;
+          }
+          const author = names.current.get(peerId) ?? "Гость";
+          setMessages((history) => [
+            ...history,
+            { id: `${message.at}-${peerId}-${history.length}`, author, text: message.text, at: message.at, own: false },
+          ]);
+          setUnread((count) => (chatOpenRef.current ? 0 : count + 1));
+        };
 
         // Отдаем то, что показываем прямо сейчас: камеру или демонстрацию экрана.
         stream.getAudioTracks().forEach((track) => peer.addTrack(track, stream));
@@ -193,8 +267,11 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       };
 
       const drop = (peerId: string) => {
+        channels.current.get(peerId)?.close();
+        channels.current.delete(peerId);
         connections.current.get(peerId)?.close();
         connections.current.delete(peerId);
+        names.current.delete(peerId);
         pending.delete(peerId);
         setPeers((current) => current.filter((peer) => peer.id !== peerId));
       };
@@ -206,13 +283,18 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         if (!from) return;
 
         if (message.type === "peer-joined") {
+          const peerName = message.name || "Гость";
+          names.current.set(from, peerName);
           setPeers((current) => current.some((peer) => peer.id === from)
             ? current
-            : [...current, { id: from, name: message.name || "Гость", stream: null, live: false }]);
+            : [...current, { id: from, name: peerName, stream: null, live: false }]);
+          toast(`${peerName} присоединился`, { id: `join-${from}` });
           connect(from); // addTrack поднимет negotiationneeded, оффер уйдет сам
           return;
         }
         if (message.type === "peer-left") {
+          const peerName = names.current.get(from);
+          if (peerName) toast(`${peerName} вышел`, { id: `left-${from}` });
           drop(from);
           return;
         }
@@ -255,6 +337,9 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       cleanup.current = (resetUrl = true) => {
         closed = true;
         events.close();
+        channels.current.forEach((channel) => channel.close());
+        channels.current.clear();
+        names.current.clear();
         connections.current.forEach((peer) => peer.close());
         connections.current.clear();
         screenTrack.current?.stop();
@@ -278,6 +363,32 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
       setError(reason instanceof Error ? reason.message : "Не удалось войти в звонок.");
     }
   }
+
+  function toggleChat(open: boolean) {
+    setChatOpen(open);
+    chatOpenRef.current = open;
+    if (open) setUnread(0);
+  }
+
+  // Горячие клавиши как в переговорках: работают, пока фокус не в поле ввода.
+  useEffect(() => {
+    if (screen !== "call") return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable]")) return;
+      const key = event.key.toLowerCase();
+      // Раскладку не переключают ради горячей клавиши, поэтому ловим и кириллицу.
+      if (key === "m" || key === "ь") toggleTrack("audio");
+      else if (key === "v" || key === "м") toggleTrack("video");
+      else if (key === "s" || key === "ы") void toggleShare();
+      else if (key === "c" || key === "с") toggleChat(!chatOpenRef.current);
+      else return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   function endCall() {
     cleanup.current();
@@ -356,7 +467,15 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
 
   if (screen === "call") {
     const tiles = [
-      { id: "self", name: sharing ? `${name} · ваш экран` : `${name} · вы`, stream: preview ?? localStream, live: true, self: true, mirror: !sharing },
+      {
+        id: "self",
+        name: sharing ? `${name} · ваш экран` : `${name} · вы`,
+        stream: preview ?? localStream,
+        live: true,
+        self: true,
+        mirror: !sharing,
+        state: { muted, cameraOff, sharing },
+      },
       ...peers.map((peer) => ({ ...peer, self: false, mirror: false })),
     ];
     return (
@@ -378,10 +497,41 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
             )}
           </div>
 
-          <Button variant="secondary" size="sm" onClick={copyInvite}>
-            <Link2 />
-            <span className="hidden sm:inline">Пригласить</span>
-          </Button>
+          <div className="flex items-center gap-2">
+            <CallChat
+              messages={messages}
+              onSend={sendChat}
+              open={chatOpen}
+              onOpenChange={toggleChat}
+              trigger={
+                <Button variant="ghost" size="sm" className="relative" aria-label="Чат звонка">
+                  <MessageSquare />
+                  <span className="hidden sm:inline">Чат</span>
+                  {unread > 0 && (
+                    <Badge className="absolute -top-1 -right-1 size-4 justify-center rounded-full p-0 text-[10px] tabular-nums">
+                      {unread > 9 ? "9+" : unread}
+                    </Badge>
+                  )}
+                </Button>
+              }
+            />
+            <CallSettings
+              provider={provider}
+              onProviderChange={changeProvider}
+              participants={peers}
+              stats={stats}
+              trigger={
+                <Button variant="ghost" size="sm" aria-label="Соединение и качество связи">
+                  <SignalHigh />
+                  <span className="hidden sm:inline">Соединение</span>
+                </Button>
+              }
+            />
+            <Button variant="secondary" size="sm" onClick={copyInvite}>
+              <Link2 />
+              <span className="hidden sm:inline">Пригласить</span>
+            </Button>
+          </div>
         </header>
 
         <section className="border-border bg-stage relative min-h-0 overflow-hidden rounded-xl border shadow-2xl" aria-label="Видеозвонок">
@@ -404,7 +554,9 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
             </div>
           ) : (
             <div className={cn("grid h-full auto-rows-[minmax(0,1fr)] gap-2.5 p-2.5 pb-24", gridColumns(tiles.length))}>
-              {tiles.map((tile) => <VideoTile key={tile.id} {...tile} />)}
+              {tiles.map((tile) => (
+                <VideoTile key={tile.id} {...tile} stats={stats[tile.id]} speaking={speaking[tile.id]} />
+              ))}
             </div>
           )}
 
@@ -424,6 +576,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
               pressed={muted}
               onPressedChange={() => toggleTrack("audio")}
               label={muted ? "Включить микрофон" : "Выключить микрофон"}
+              hotkey="M"
             >
               {muted ? <MicOff /> : <Mic />}
             </ControlToggle>
@@ -433,6 +586,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
               disabled={!hasCamera}
               onPressedChange={() => toggleTrack("video")}
               label={!hasCamera ? "Камера не найдена" : cameraOff ? "Включить камеру" : "Выключить камеру"}
+              hotkey="V"
             >
               {cameraOff ? <VideoOff /> : <Video />}
             </ControlToggle>
@@ -443,6 +597,7 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
                 tone="accent"
                 onPressedChange={toggleShare}
                 label={sharing ? "Остановить демонстрацию" : "Показать экран"}
+                hotkey="S"
               >
                 {sharing ? <MonitorX /> : <MonitorUp />}
               </ControlToggle>
@@ -590,8 +745,9 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
 }
 
 // Нажатое состояние читается цветом: красный — что-то выключено, синий — идет демонстрация.
-function ControlToggle({ label, tone = "danger", children, ...props }: React.ComponentProps<typeof Toggle> & {
+function ControlToggle({ label, hotkey, tone = "danger", children, ...props }: React.ComponentProps<typeof Toggle> & {
   label: string;
+  hotkey?: string;
   tone?: "danger" | "accent";
 }) {
   return (
@@ -612,7 +768,12 @@ function ControlToggle({ label, tone = "danger", children, ...props }: React.Com
           {children}
         </Toggle>
       </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
+      <TooltipContent className="flex items-center gap-2">
+        {label}
+        {hotkey && (
+          <kbd className="bg-background/20 rounded px-1 font-mono text-[10px] tracking-wide uppercase">{hotkey}</kbd>
+        )}
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -624,13 +785,16 @@ function gridColumns(count: number) {
   return "grid-cols-2 lg:grid-cols-4";
 }
 
-function VideoTile({ name, stream, live, self = false, mirror = false }: {
+function VideoTile({ name, stream, live, self = false, mirror = false, stats, speaking, state }: {
   id: string;
   name: string;
   stream: MediaStream | null;
   live: boolean;
   self?: boolean;
   mirror?: boolean;
+  stats?: PeerStats;
+  speaking?: boolean;
+  state?: PeerState;
 }) {
   const video = useRef<HTMLVideoElement>(null);
   const hasVideo = useLiveVideo(stream);
@@ -640,7 +804,13 @@ function VideoTile({ name, stream, live, self = false, mirror = false }: {
   }, [stream]);
 
   return (
-    <div className="bg-stage-elevated relative grid size-full min-h-0 place-items-center overflow-hidden rounded-xl">
+    <div
+      className={cn(
+        "bg-stage-elevated relative grid size-full min-h-0 place-items-center overflow-hidden rounded-xl",
+        "ring-primary ring-offset-stage transition-shadow duration-200",
+        speaking && !state?.muted && "ring-2 ring-offset-2",
+      )}
+    >
       <video
         ref={video}
         autoPlay
@@ -659,12 +829,41 @@ function VideoTile({ name, stream, live, self = false, mirror = false }: {
         variant="secondary"
         className="absolute bottom-2 left-2 max-w-[calc(100%-1rem)] gap-1.5 bg-black/60 text-white backdrop-blur-sm"
       >
+        {state?.muted && <MicOff className="text-destructive size-3 shrink-0" />}
+        {state?.sharing && <MonitorUp className="text-primary size-3 shrink-0" />}
         <span className="truncate">{name}</span>
         {!live && !self && <span className="text-muted-foreground shrink-0">· подключается</span>}
       </Badge>
+
+      {!self && live && stats?.rtt != null && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge
+              variant="secondary"
+              className="absolute top-2 right-2 gap-1 bg-black/60 font-mono text-[10px] backdrop-blur-sm"
+            >
+              <span className={cn("size-1.5 rounded-full", SIGNAL_COLOR[rttQuality(stats.rtt)])} />
+              {stats.rtt} мс
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="left" className="font-mono text-xs">
+            <div>задержка {stats.rtt} мс</div>
+            {stats.loss != null && <div>потери {stats.loss}%</div>}
+            {stats.kbps != null && <div>{stats.kbps} кбит/с</div>}
+            {stats.width && <div>{stats.width}×{stats.height}{stats.fps ? ` · ${stats.fps} fps` : ""}</div>}
+          </TooltipContent>
+        </Tooltip>
+      )}
     </div>
   );
 }
+
+const SIGNAL_COLOR: Record<ReturnType<typeof rttQuality>, string> = {
+  good: "bg-emerald-400",
+  fair: "bg-amber-400",
+  poor: "bg-destructive",
+  unknown: "bg-muted-foreground",
+};
 
 // Видео есть, только если трек живой и не заглушен отправителем — иначе показываем инициалы.
 function useLiveVideo(stream: MediaStream | null) {
