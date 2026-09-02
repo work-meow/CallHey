@@ -314,13 +314,13 @@ export function CallApp({ initialRoom, signalUrl, turn }: Props) {
         </form>
       </section>
 
-      <footer><span>ТЫТУТ / ЗВОНКИ</span><span>Разговор остается между вами</span></footer>
+      <footer><span>CALLHEY / ЗВОНКИ</span><span>Разговор остается между вами</span></footer>
     </main>
   );
 }
 
 function Logo({ inverse = false }: { inverse?: boolean }) {
-  return <div className={`logo ${inverse ? "inverse" : ""}`}><span>Т</span>ТыТут<small>звонки</small></div>;
+  return <div className={`logo ${inverse ? "inverse" : ""}`}><span>C</span>allHey<small>звонки</small></div>;
 }
 
 function Icon({ name }: { name: "arrow" | "bolt" | "camera" | "check" | "link" | "lock" | "mic" | "mic-off" | "phone" | "shield" | "spark" | "video" | "video-off" }) {
