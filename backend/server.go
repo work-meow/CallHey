@@ -17,8 +17,10 @@ import (
 )
 
 const (
-	maxRooms       = 10_000
-	participantTTL = 30 * time.Second
+	maxRooms = 10_000
+	// ponytail: mesh — каждый шлет свое видео каждому, выше 8 участников нужен SFU
+	maxParticipants = 8
+	participantTTL  = 20 * time.Second
 )
 
 var roomPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,32}$`)
@@ -31,14 +33,27 @@ type signalServer struct {
 }
 
 type participant struct {
-	name     string
-	events   chan event
+	id   string
+	name string
+	// Очередь, а не канал: сообщение удаляется только после успешной отправки,
+	// поэтому обрыв SSE не съедает offer или ICE-кандидат.
+	queue    []event
+	wake     chan struct{}
 	active   bool
+	stream   context.CancelFunc
+	gen      uint64
 	lastSeen time.Time
+}
+
+type peerInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 type event struct {
 	Type      string          `json:"type"`
+	From      string          `json:"from,omitempty"`
+	To        string          `json:"to,omitempty"`
 	Name      string          `json:"name,omitempty"`
 	SDP       json.RawMessage `json:"sdp,omitempty"`
 	Candidate json.RawMessage `json:"candidate,omitempty"`
@@ -57,6 +72,8 @@ func newSignalServer(allowedOrigins string) *signalServer {
 	mux.HandleFunc("GET /rooms/{room}/events", s.events)
 	mux.HandleFunc("POST /rooms/{room}/signals", s.signal)
 	mux.HandleFunc("DELETE /rooms/{room}/participants", s.leave)
+	// sendBeacon умеет только POST, но именно он доезжает при закрытии вкладки.
+	mux.HandleFunc("POST /rooms/{room}/leave", s.leave)
 	s.handler = s.cors(mux)
 	return s
 }
@@ -84,12 +101,17 @@ func (s *signalServer) join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := randomToken()
+	token, err := randomString(24)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "Не удалось создать звонок.")
 		return
 	}
-	p := &participant{name: body.Name, events: make(chan event, 32), lastSeen: time.Now()}
+	id, err := randomString(9)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "Не удалось создать звонок.")
+		return
+	}
+	p := &participant{id: id, name: body.Name, wake: make(chan struct{}, 1), lastSeen: time.Now()}
 
 	s.mu.Lock()
 	participants := s.rooms[room]
@@ -99,27 +121,27 @@ func (s *signalServer) join(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "Сервис временно занят.")
 			return
 		}
-		participants = make(map[string]*participant, 2)
+		participants = make(map[string]*participant, maxParticipants)
 		s.rooms[room] = participants
 	}
-	if len(participants) >= 2 {
+	if len(participants) >= maxParticipants {
 		s.mu.Unlock()
-		writeError(w, http.StatusConflict, "В звонке уже два участника.")
+		writeError(w, http.StatusConflict, fmt.Sprintf("В звонке уже %d участников — это максимум.", maxParticipants))
 		return
 	}
-	var peer *participant
+	peers := make([]peerInfo, 0, len(participants))
+	others := make([]*participant, 0, len(participants))
 	for _, current := range participants {
-		peer = current
+		peers = append(peers, peerInfo{ID: current.id, Name: current.name})
+		others = append(others, current)
 	}
 	participants[token] = p
 	s.mu.Unlock()
 
-	peerName := ""
-	if peer != nil {
-		peerName = peer.name
-		s.emit(peer, event{Type: "peer-joined", Name: p.name})
+	for _, other := range others {
+		s.emit(other, event{Type: "peer-joined", From: id, Name: body.Name})
 	}
-	writeJSON(w, http.StatusCreated, map[string]string{"token": token, "peer": peerName})
+	writeJSON(w, http.StatusCreated, map[string]any{"token": token, "id": id, "peers": peers})
 }
 
 func (s *signalServer) events(w http.ResponseWriter, r *http.Request) {
@@ -134,20 +156,31 @@ func (s *signalServer) events(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Поток событий недоступен.")
 		return
 	}
+	// Поток живет весь звонок, поэтому снимаем таймауты сервера — иначе он умрет через ReadTimeout.
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Time{})
+	_ = controller.SetWriteDeadline(time.Time{})
 
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	// Переподключение вытесняет прошлый поток вместо отказа: иначе EventSource,
+	// получив не-200, закрывается навсегда. Поколение гарантирует, что очередь
+	// читает ровно один поток.
 	s.mu.Lock()
-	if p.active {
-		s.mu.Unlock()
-		writeError(w, http.StatusConflict, "Сессия уже открыта.")
-		return
-	}
-	p.active = true
-	p.lastSeen = time.Now()
+	previous := p.stream
+	p.gen++
+	generation := p.gen
+	p.stream, p.active, p.lastSeen = cancel, true, time.Now()
 	s.mu.Unlock()
+	if previous != nil {
+		previous()
+	}
 	defer func() {
 		s.mu.Lock()
-		p.active = false
-		p.lastSeen = time.Now()
+		if p.gen == generation {
+			p.stream, p.active, p.lastSeen = nil, false, time.Now()
+		}
 		s.mu.Unlock()
 	}()
 
@@ -160,15 +193,19 @@ func (s *signalServer) events(w http.ResponseWriter, r *http.Request) {
 	defer ticker.Stop()
 
 	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case message := <-p.events:
+		if message, ok := s.take(p, generation); ok {
 			payload, _ := json.Marshal(message)
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
 				return
 			}
 			flusher.Flush()
+			s.drop(p, generation)
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.wake:
 		case <-ticker.C:
 			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
 				return
@@ -179,22 +216,25 @@ func (s *signalServer) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *signalServer) signal(w http.ResponseWriter, r *http.Request) {
-	p := s.participant(r.PathValue("room"), r.URL.Query().Get("token"))
+	room, token := r.PathValue("room"), r.URL.Query().Get("token")
+	p := s.participant(room, token)
 	if p == nil {
 		writeError(w, http.StatusNotFound, "Сессия звонка завершена.")
 		return
 	}
 	var message event
-	if err := readJSON(w, r, &message, 64<<10); err != nil || (message.Type != "offer" && message.Type != "answer" && message.Type != "ice") {
+	if err := readJSON(w, r, &message, 64<<10); err != nil || message.To == "" ||
+		(message.Type != "offer" && message.Type != "answer" && message.Type != "ice") {
 		writeError(w, http.StatusBadRequest, "Некорректный сигнал соединения.")
 		return
 	}
-	peer := s.peer(r.PathValue("room"), r.URL.Query().Get("token"))
-	if peer == nil {
-		writeError(w, http.StatusConflict, "Собеседник еще не подключился.")
+	target := s.byID(room, message.To)
+	if target == nil {
+		writeError(w, http.StatusConflict, "Собеседник вышел из звонка.")
 		return
 	}
-	if !s.emit(peer, message) {
+	message.From, message.To, message.Name = p.id, "", ""
+	if !s.emit(target, message) {
 		writeError(w, http.StatusServiceUnavailable, "Слишком много сигналов соединения.")
 		return
 	}
@@ -202,7 +242,7 @@ func (s *signalServer) signal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *signalServer) leave(w http.ResponseWriter, r *http.Request) {
-	if !s.remove(r.PathValue("room"), r.URL.Query().Get("token")) {
+	if !s.remove(r.PathValue("room"), r.URL.Query().Get("token"), time.Time{}) {
 		writeError(w, http.StatusNotFound, "Сессия звонка уже завершена.")
 		return
 	}
@@ -225,11 +265,11 @@ func (s *signalServer) participant(room, token string) *participant {
 	return s.rooms[room][token]
 }
 
-func (s *signalServer) peer(room, token string) *participant {
+func (s *signalServer) byID(room, id string) *participant {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for currentToken, p := range s.rooms[room] {
-		if currentToken != token {
+	for _, p := range s.rooms[room] {
+		if p.id == id {
 			return p
 		}
 	}
@@ -237,38 +277,68 @@ func (s *signalServer) peer(room, token string) *participant {
 }
 
 func (s *signalServer) emit(p *participant, message event) bool {
-	select {
-	case p.events <- message:
-		return true
-	default:
+	s.mu.Lock()
+	if len(p.queue) >= 256 {
+		s.mu.Unlock()
 		return false
+	}
+	p.queue = append(p.queue, message)
+	s.mu.Unlock()
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+func (s *signalServer) take(p *participant, generation uint64) (event, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.gen != generation || len(p.queue) == 0 {
+		return event{}, false
+	}
+	return p.queue[0], true
+}
+
+func (s *signalServer) drop(p *participant, generation uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.gen == generation && len(p.queue) > 0 {
+		p.queue = p.queue[1:]
 	}
 }
 
-func (s *signalServer) remove(room, token string) bool {
+// remove выкидывает участника из комнаты. Ненулевой staleBefore удаляет только тех,
+// кто отключился и не возвращался до этого момента.
+func (s *signalServer) remove(room, token string, staleBefore time.Time) bool {
 	s.mu.Lock()
 	participants := s.rooms[room]
-	if participants == nil || participants[token] == nil {
+	p := participants[token]
+	if p == nil || (!staleBefore.IsZero() && (p.active || p.lastSeen.After(staleBefore))) {
 		s.mu.Unlock()
 		return false
 	}
 	delete(participants, token)
-	var peer *participant
+	rest := make([]*participant, 0, len(participants))
 	for _, current := range participants {
-		peer = current
+		rest = append(rest, current)
 	}
 	if len(participants) == 0 {
 		delete(s.rooms, room)
 	}
+	if p.stream != nil {
+		p.stream()
+	}
 	s.mu.Unlock()
-	if peer != nil {
-		s.emit(peer, event{Type: "peer-left"})
+
+	for _, current := range rest {
+		s.emit(current, event{Type: "peer-left", From: p.id})
 	}
 	return true
 }
 
 func (s *signalServer) prune(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
@@ -286,31 +356,9 @@ func (s *signalServer) prune(ctx context.Context) {
 			}
 			s.mu.Unlock()
 			for _, entry := range stale {
-				s.removeIfStale(entry[0], entry[1], now)
+				s.remove(entry[0], entry[1], now.Add(-participantTTL))
 			}
 		}
-	}
-}
-
-func (s *signalServer) removeIfStale(room, token string, now time.Time) {
-	s.mu.Lock()
-	participants := s.rooms[room]
-	p := participants[token]
-	if p == nil || p.active || now.Sub(p.lastSeen) <= participantTTL {
-		s.mu.Unlock()
-		return
-	}
-	delete(participants, token)
-	var peer *participant
-	for _, current := range participants {
-		peer = current
-	}
-	if len(participants) == 0 {
-		delete(s.rooms, room)
-	}
-	s.mu.Unlock()
-	if peer != nil {
-		s.emit(peer, event{Type: "peer-left"})
 	}
 }
 
@@ -349,8 +397,8 @@ func readJSON(w http.ResponseWriter, r *http.Request, target any, limit int64) e
 	return nil
 }
 
-func randomToken() (string, error) {
-	value := make([]byte, 24)
+func randomString(size int) (string, error) {
+	value := make([]byte, size)
 	if _, err := rand.Read(value); err != nil {
 		return "", err
 	}

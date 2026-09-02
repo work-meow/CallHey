@@ -18,7 +18,7 @@ func main() {
 		Addr:              addr,
 		Handler:           app,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
+		ReadTimeout:       10 * time.Second, // SSE-обработчик снимает этот дедлайн через ResponseController
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    8 << 10,
 	}
